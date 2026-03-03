@@ -1,11 +1,3 @@
-# search bluesky likes
+# atmo tools
 
-static client side app that allows you to search your bluesky likes
-
-## how to run
-
-```bash
-npm install
-npm run dev
-```
-
+- search your bluesky likes

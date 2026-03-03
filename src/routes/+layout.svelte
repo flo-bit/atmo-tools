@@ -1,22 +1,24 @@
 <script lang="ts">
 	import '../app.css';
 
-	import { onMount } from 'svelte';
-	import { initClient } from '$lib/oauth';
-	import { Head, ThemeToggle, Toaster } from '@fuxui/base';
+	import { AtprotoLoginModal } from '@foxui/social';
+	import { Head, ThemeToggle, Toaster } from '@foxui/core';
+	import { login } from '$lib/atproto';
 
 	let { children } = $props();
-
-	onMount(() => {
-		initClient();
-	});
 </script>
 
 {@render children()}
 
+<AtprotoLoginModal
+	login={async (handle) => {
+		await login(handle);
+		return true;
+	}}
+/>
 
 <Toaster />
 
-<Head title="Search Bluesky Likes" emojiFavicon="🦋" />
+<Head title="Search Bluesky" emojiFavicon="🦋" />
 
 <ThemeToggle class="fixed top-4 right-4" />

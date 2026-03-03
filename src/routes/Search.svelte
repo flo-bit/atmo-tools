@@ -1,187 +1,46 @@
 <script lang="ts">
-	import { client, logout } from '$lib/oauth';
-	import { Avatar, Button, Heading, Input, Modal, Navbar, Popover, ThemeToggle, toast } from '@fuxui/base';
-	import { blueskyPostToPostData, Post } from '$lib/post';
-	import { Document, Charset, IndexedDB } from 'flexsearch';
+	import { user, logout } from '$lib/atproto';
+	import { Avatar, Button, Heading, Input, Modal, Navbar, Popover, ThemeToggle } from '@foxui/core';
+	import { blueskyPostToPostData, Post } from '@foxui/social';
 	import { onMount } from 'svelte';
-
-	let index: Document;
-	let likesIds = $state(new Set<string>());
-
-	let loading = $state(true);
-
-	let count = $state(0);
-
-	function addLikeId(id: string) {
-		likesIds.add(id);
-		// save in local storage
-		localStorage.setItem('likes-ids', Array.from(likesIds).join(','));
-
-		count = likesIds.size;
-	}
-
-	function getLikesIds() {
-		const ids = localStorage.getItem('likes-ids');
-		if (ids) {
-			likesIds = new Set(ids.split(','));
-		}
-
-		count = likesIds.size;
-	}
-
-	function clearLikesIds() {
-		likesIds.clear();
-		localStorage.removeItem('likes-ids');
-
-		count = 0;
-	}
-
-	async function clearIndex() {
-		if (!index) return;
-
-		clearLikesIds();
-		index.clear();
-
-		await index.commit();
-	}
-
-	onMount(async () => {
-		const db = new IndexedDB('likes-store');
-
-		index = new Document({
-			document: {
-				id: 'uri',
-				store: true,
-				index: [
-					{
-						field: 'author:handle',
-						tokenize: 'forward',
-						encoder: Charset.LatinBalance
-					},
-					{
-						field: 'author:displayName',
-						tokenize: 'forward',
-						encoder: Charset.LatinBalance
-					},
-					{
-						field: 'record:text',
-						tokenize: 'forward',
-						encoder: Charset.LatinBalance
-					}
-				],
-				tag: [
-					{
-						field: 'likeCount'
-					},
-					{
-						field: 'replyCount'
-					},
-					{
-						field: 'author:handle'
-					},
-					{
-						field: 'author:displayName'
-					}
-				]
-			}
-		});
-
-		await index.mount(db);
-
-		getLikesIds();
-		getLikes();
-	});
-
-	async function getLikes() {
-		if (!client.profile?.did || !client.rpc || !index) return;
-
-		let all = [];
-
-		let cursor = undefined;
-		let response = undefined;
-		let found = false;
-		let limit = 100;
-		do {
-			try {
-				response = await client.rpc.request({
-					type: 'get',
-					nsid: 'app.bsky.feed.getActorLikes',
-					params: {
-						actor: client.profile.did,
-						limit,
-						cursor
-					}
-				});
-			} catch (error) {
-				// logout
-				await logout();
-				toast.error('Failed to get likes, please login again');
-				break;
-			}
-			all.push(...response?.data.feed);
-
-			cursor = response?.data.cursor;
-
-			for (let like of response?.data.feed) {
-				if (!likesIds.has(like.post.uri)) {
-					addLikeId(like.post.uri);
-					continue;
-				}
-
-				found = true;
-				cursor = localStorage.getItem('cursor');
-
-				if (cursor) {
-					localStorage.removeItem('cursor');
-					found = false;
-				}
-
-				break;
-			}
-
-			if (cursor && response?.data.feed.length > 0) {
-				localStorage.setItem('cursor', cursor);
-			} else {
-				localStorage.removeItem('cursor');
-			}
-		} while (cursor && response?.data.feed.length > 0 && !found);
-
-		for (let like of all) {
-			index.add(like.post);
-		}
-
-		await index.commit();
-
-		loading = false;
-	}
+	import {
+		searchState,
+		initSources,
+		switchSource,
+		clearSource,
+		startLoading,
+		searchIndex,
+		SOURCE_LABELS,
+		PLACEHOLDERS,
+		ALL_SOURCES,
+		type SourceType
+	} from '$lib/search-state.svelte';
 
 	let input: HTMLInputElement | null = $state(null);
-
 	let search = $state('');
-	let results = $state([]);
+	let results: any[] = $state([]);
+	let infoModalOpen = $state(false);
 
-	$effect(() => {
-		if (!search) return;
-
-		index
-			.search({
-				query: search,
-				enrich: true,
-				merge: true,
-				limit: 20
-			})
-			.then((res) => {
-				results = res;
-			});
+	onMount(() => {
+		initSources();
 	});
 
-	function getLink(uri: string, handle: string) {
-		const [did, collection, rkey] = uri.replace('at://', '').split('/');
-
-		return `https://bsky.app/profile/${handle}/post/${rkey}`;
+	function handleSwitchSource(source: SourceType) {
+		switchSource(source);
+		search = '';
+		results = [];
 	}
 
-	let infoModalOpen = $state(false);
+	$effect(() => {
+		if (!search) {
+			results = [];
+			return;
+		}
+
+		searchIndex(search).then((res) => {
+			results = res;
+		});
+	});
 </script>
 
 <svelte:window
@@ -190,30 +49,60 @@
 	}}
 />
 
-{#if loading}
-	<Heading>Loading your likes... ({count})</Heading>
+{#if searchState.loading}
+	<Heading>Loading...</Heading>
 {:else}
-	<Navbar class="mx-2 max-w-xl sm:mx-auto md:top-10">
+	<Navbar class="mx-2 h-auto max-w-xl flex-col items-start sm:mx-auto md:top-10">
+		<div class="mb-4 mx-2 flex items-baseline gap-2">
+			<span class="text-base-600 dark:text-base-400 text-sm font-medium">Search my</span>
+			<div class="flex gap-1">
+				{#each ALL_SOURCES as source}
+					<button
+						class="cursor-pointer rounded-full px-3 py-1 text-sm font-medium transition-colors {searchState.activeSource ===
+						source
+							? 'bg-accent-600 text-white'
+							: 'text-base-600 dark:text-base-400 hover:bg-base-200 dark:hover:bg-base-800'}"
+						onclick={() => handleSwitchSource(source)}
+					>
+						{SOURCE_LABELS[source]}
+					</button>
+				{/each}
+			</div>
+		</div>
+
 		<Input
 			bind:ref={input}
 			bind:value={search}
 			class="w-full"
 			sizeVariant="lg"
-			placeholder="Search liked posts"
+			placeholder={PLACEHOLDERS[searchState.activeSource]}
 		/>
+
+		<span class="text-base-600 dark:text-base-400 mt-2 w-full text-center text-xs">
+			{#if searchState.sources[searchState.activeSource].phase === 'fetching'}
+				loading {SOURCE_LABELS[searchState.activeSource].toLowerCase()}... ({searchState.sources[
+					searchState.activeSource
+				].count})
+			{:else if searchState.sources[searchState.activeSource].phase === 'hydrating'}
+				indexed {searchState.sources[searchState.activeSource].indexed} out of {searchState.sources[
+					searchState.activeSource
+				].totalToIndex}
+				{SOURCE_LABELS[searchState.activeSource].toLowerCase()}
+			{:else}
+				results: {search ? results.length : 0}, {SOURCE_LABELS[
+					searchState.activeSource
+				].toLowerCase()} loaded: {searchState.sources[searchState.activeSource].count}
+			{/if}
+		</span>
 	</Navbar>
-	<span class="text-base-600 dark:text-base-400 text-xs"
-		>results: {search ? results.length : 0}, likes loaded: {likesIds.size}</span
-	>
 {/if}
 
 {#if results.length > 0 && search}
-	<ul class=" mt-4 flex flex-col divide-y text-sm">
+	<ul class="pt-20 flex flex-col divide-y text-sm">
 		{#each results as result (result.doc.uri)}
 			<div class="border-base-200 dark:border-base-900 relative border-b py-2">
 				<Post
-					href={getLink(result.doc.uri, result.doc.author.handle)}
-					liked
+					liked={searchState.activeSource === 'likes'}
 					data={blueskyPostToPostData(result.doc)}
 					class="pb-2"
 				/>
@@ -228,10 +117,10 @@
 	<Popover class="flex flex-col items-start gap-2 p-2">
 		{#snippet child({ props })}
 			<button {...props} class="cursor-pointer hover:opacity-90">
-				<Avatar src={client.profile?.avatar} />
+				<Avatar src={user.profile?.avatar} />
 			</button>
 		{/snippet}
-		<ThemeToggle class="backdrop-blur-none absolute top-1 right-1" />
+		<ThemeToggle class="absolute top-1 right-1 backdrop-blur-none" />
 		<Button class="backdrop-blur-none" variant="ghost" onclick={() => (infoModalOpen = true)}
 			>Info</Button
 		>
@@ -239,10 +128,9 @@
 			class="backdrop-blur-none"
 			variant="ghost"
 			onclick={() => {
-				clearIndex();
-				loading = true;
-				getLikes();
-			}}>Refresh all</Button
+				clearSource(searchState.activeSource);
+				startLoading(searchState.activeSource);
+			}}>Refresh {SOURCE_LABELS[searchState.activeSource].toLowerCase()}</Button
 		>
 		<Button class="backdrop-blur-none" variant="ghost" onclick={logout}>Logout</Button>
 	</Popover>
