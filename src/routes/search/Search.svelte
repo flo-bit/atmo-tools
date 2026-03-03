@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { Input, Navbar } from '@foxui/core';
-	import { AtprotoHandlePopup, blueskyPostToPostData, Post } from '@foxui/social';
+	import { AtprotoHandlePopup, BlueskyPost, blueskyPostToPostData, Post } from '@foxui/social';
 	import { onMount } from 'svelte';
 	import {
 		searchState,
@@ -268,12 +268,13 @@
 {#if results.length > 0}
 	<ul class="{showFilters ? 'pt-90 md:pt-80' : 'pt-32 md:pt-20'} flex flex-col divide-y divide-base-200 dark:divide-base-800 text-sm">
 		{#each results as result (result.doc.uri)}
-			<li class="py-2">
-				<Post
+			<li class="py-4">
+				<BlueskyPost
+				
 					liked={result.doc.sources?.includes('likes')}
 					bookmarked={result.doc.sources?.includes('bookmarks')}
-					data={blueskyPostToPostData(result.doc)}
-					class="pb-2"
+					showLogo
+					feedViewPost={result.doc}
 				/>
 			</li>
 		{/each}
