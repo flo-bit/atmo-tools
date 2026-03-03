@@ -52,6 +52,31 @@ export const listPostRecords = command(
 	}
 );
 
+export const listRepostRecords = command(
+	v.object({
+		limit: v.optional(v.pipe(v.number(), v.minValue(1), v.maxValue(100))),
+		cursor: v.optional(v.string())
+	}),
+	async (input) => {
+		const { locals } = getRequestEvent();
+		if (!locals.client || !locals.did) error(401, 'Not authenticated');
+
+		const response = await locals.client.get('com.atproto.repo.listRecords', {
+			params: {
+				repo: locals.did,
+				collection: 'app.bsky.feed.repost',
+				limit: input.limit ?? 100,
+				cursor: input.cursor,
+				reverse: false
+			}
+		});
+
+		if (!response.ok) error(500, 'Failed to fetch repost records');
+
+		return response.data;
+	}
+);
+
 export const getBookmarks = command(
 	v.object({
 		limit: v.optional(v.pipe(v.number(), v.minValue(1), v.maxValue(100))),

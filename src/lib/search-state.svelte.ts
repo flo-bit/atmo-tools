@@ -2,44 +2,69 @@ import { user } from '$lib/atproto';
 import { toast } from '@foxui/core';
 import { Document, Charset, IndexedDB } from 'flexsearch';
 import { Client, simpleFetchHandler } from '@atcute/client';
+import { db, type StoredPost } from '$lib/db';
 
-export type SourceType = 'likes' | 'bookmarks' | 'posts';
+export type SourceType = 'likes' | 'bookmarks' | 'posts' | 'reposts';
+
+export type SearchFilters = {
+	handles: string[];
+	minLikes: number;
+	minReposts: number;
+	minReplies: number;
+	dateAfter: string;
+	dateBefore: string;
+	hasImage: boolean;
+	hasLink: boolean;
+	hasVideo: boolean;
+	showReplies: boolean;
+};
+
+export const DEFAULT_FILTERS: SearchFilters = {
+	handles: [],
+	minLikes: 0,
+	minReposts: 0,
+	minReplies: 0,
+	dateAfter: '',
+	dateBefore: '',
+	hasImage: false,
+	hasLink: false,
+	hasVideo: false,
+	showReplies: true
+};
 
 export const SOURCE_LABELS: Record<SourceType, string> = {
 	likes: 'Likes',
 	bookmarks: 'Bookmarks',
-	posts: 'Posts'
+	posts: 'Posts',
+	reposts: 'Reposts'
 };
 
 export const PLACEHOLDERS: Record<SourceType, string> = {
 	likes: 'Search liked posts',
 	bookmarks: 'Search bookmarks',
-	posts: 'Search my posts'
+	posts: 'Search my posts',
+	reposts: 'Search reposted posts'
 };
 
-export const ALL_SOURCES: SourceType[] = ['likes', 'bookmarks', 'posts'];
+export const ALL_SOURCES: SourceType[] = ['likes', 'bookmarks', 'posts', 'reposts'];
 
 type SourceState = {
-	knownIds: Set<string>;
 	index: Document | null;
 	count: number;
 	indexed: number;
 	totalToIndex: number;
 	phase: 'idle' | 'fetching' | 'hydrating' | 'done';
-	cursor?: string;
 	pendingUris: string[];
 	pendingIndex: number;
 };
 
 function createSourceState(): SourceState {
 	return {
-		knownIds: new Set(),
 		index: null,
 		count: 0,
 		indexed: 0,
 		totalToIndex: 0,
 		phase: 'idle',
-		cursor: undefined,
 		pendingUris: [],
 		pendingIndex: 0
 	};
@@ -49,7 +74,7 @@ function createIndex() {
 	return new Document({
 		document: {
 			id: 'uri',
-			store: true,
+			store: false,
 			index: [
 				{
 					field: 'author:handle',
@@ -66,12 +91,6 @@ function createIndex() {
 					tokenize: 'forward',
 					encoder: Charset.LatinBalance
 				}
-			],
-			tag: [
-				{ field: 'likeCount' },
-				{ field: 'replyCount' },
-				{ field: 'author:handle' },
-				{ field: 'author:displayName' }
 			]
 		}
 	});
@@ -85,61 +104,42 @@ export const searchState = $state({
 	sources: {
 		likes: createSourceState(),
 		bookmarks: createSourceState(),
-		posts: createSourceState()
+		posts: createSourceState(),
+		reposts: createSourceState()
 	} as Record<SourceType, SourceState>,
-	activeSource: 'likes' as SourceType,
-	loading: true
+	activeSource: 'likes' as SourceType
 });
 
 let generation = 0;
 
-function loadKnownIds(source: SourceType) {
-	const ids = localStorage.getItem(`${source}-ids`);
-	if (ids) {
-		searchState.sources[source].knownIds = new Set(ids.split(','));
-	}
-	searchState.sources[source].count = searchState.sources[source].knownIds.size;
-}
-
-function addKnownId(source: SourceType, id: string) {
-	searchState.sources[source].knownIds.add(id);
-	localStorage.setItem(
-		`${source}-ids`,
-		Array.from(searchState.sources[source].knownIds).join(',')
-	);
-	searchState.sources[source].count = searchState.sources[source].knownIds.size;
-}
-
-export function clearSource(source: SourceType) {
-	searchState.sources[source].knownIds.clear();
-	localStorage.removeItem(`${source}-ids`);
-	localStorage.removeItem(`${source}-cursor`);
-	searchState.sources[source].count = 0;
-	searchState.sources[source].indexed = 0;
-	searchState.sources[source].totalToIndex = 0;
-	searchState.sources[source].phase = 'idle';
-	searchState.sources[source].cursor = undefined;
-	searchState.sources[source].pendingUris = [];
-	searchState.sources[source].pendingIndex = 0;
-	searchState.sources[source].index?.clear();
-}
-
 export async function initSources() {
+	// Clean up legacy localStorage data
 	for (const source of ALL_SOURCES) {
-		const db = new IndexedDB(`${source}-store`);
-		searchState.sources[source].index = createIndex();
-		await searchState.sources[source].index!.mount(db);
-		loadKnownIds(source);
+		localStorage.removeItem(`${source}-ids`);
+		localStorage.removeItem(`${source}-cursor`);
 	}
 
-	searchState.loading = false;
-	startLoading('likes');
+	await Promise.all(
+		ALL_SOURCES.map(async (source) => {
+			const flexDb = new IndexedDB(`${source}-idx`);
+			searchState.sources[source].index = createIndex();
+			await searchState.sources[source].index!.mount(flexDb);
+
+			// Get count from Dexie
+			searchState.sources[source].count = await db.posts
+				.where('sources')
+				.equals(source)
+				.count();
+		})
+	);
+
+	// Start loading (active source first via loadNext)
+	startLoading(searchState.activeSource);
 }
 
 export function switchSource(source: SourceType) {
 	if (source === searchState.activeSource) return;
 	searchState.activeSource = source;
-	// Bump generation to cancel any in-flight loading
 	generation++;
 	if (searchState.sources[source].phase !== 'done') {
 		startLoading(source);
@@ -174,70 +174,107 @@ function loadNext(currentGen: number) {
 	}
 }
 
+async function fetchRecordPage(
+	source: SourceType,
+	s: SourceState,
+	fetchFn: Function,
+	cursor: string | undefined,
+	myGen: number
+): Promise<{ cursor: string | undefined; done: boolean }> {
+	if (myGen !== generation) return { cursor, done: true };
+
+	let data: any;
+	try {
+		data = await fetchFn({ limit: 100, cursor });
+	} catch (err) {
+		console.error(`Failed to fetch ${source}:`, err);
+		toast.error(`Failed to fetch ${source}`);
+		return { cursor, done: true };
+	}
+
+	const uris = data.records.map((r: any) =>
+		source === 'posts' ? r.uri : r.value.subject.uri
+	);
+	const existingDocs = await db.posts.bulkGet(uris);
+	const toUpdate: any[] = [];
+	const now = Date.now();
+
+	for (let j = 0; j < uris.length; j++) {
+		const subjectUri = uris[j];
+		const existing = existingDocs[j];
+
+		if (existing) {
+			if (existing.sources.includes(source)) {
+				// Already indexed for this source — flush updates and stop
+				if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
+				return { cursor: data.cursor, done: true };
+			}
+			// Post exists from another source — queue source tag update
+			toUpdate.push({ ...existing, sources: [...existing.sources, source], fetchedAt: now });
+			s.index!.add(existing as any);
+			s.count++;
+			continue;
+		}
+
+		s.pendingUris.push(subjectUri);
+	}
+
+	if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
+
+	const nextCursor = data.records.length > 0 ? data.cursor : undefined;
+	return { cursor: nextCursor, done: !nextCursor };
+}
+
 async function loadRecords(source: SourceType, myGen: number) {
 	if (!user.did || !searchState.sources[source].index) return;
 
-	const { listLikeRecords, listPostRecords } = await import(
+	const { listLikeRecords, listPostRecords, listRepostRecords } = await import(
 		'$lib/atproto/server/search.remote'
 	);
-	const fetchFn = source === 'likes' ? listLikeRecords : listPostRecords;
+	const fetchFn =
+		source === 'likes'
+			? listLikeRecords
+			: source === 'reposts'
+				? listRepostRecords
+				: listPostRecords;
 
 	const s = searchState.sources[source];
 
-	// Phase 1: Fetch records if not already done
 	if (s.phase === 'idle' || s.phase === 'fetching') {
 		s.phase = 'fetching';
 
-		let cursor = s.cursor;
-		let found = false;
-		let data: any;
+		const meta = await db.meta.get(source);
 
+		// Step 1: Fetch new posts from the top until we hit one we already have
+		let result = { cursor: undefined as string | undefined, done: false };
 		do {
+			result = await fetchRecordPage(source, s, fetchFn, result.cursor, myGen);
+		} while (!result.done && myGen === generation);
+
+		if (myGen !== generation) return;
+
+		// Step 2: Continue from where we left off last time (tail)
+		if (meta?.tailCursor) {
+			result = { cursor: meta.tailCursor, done: false };
+			do {
+				result = await fetchRecordPage(source, s, fetchFn, result.cursor, myGen);
+			} while (!result.done && myGen === generation);
+
 			if (myGen !== generation) return;
+		}
 
-			try {
-				data = await fetchFn({ limit: 100, cursor });
-			} catch (err) {
-				console.error(`Failed to fetch ${source}:`, err);
-				toast.error(`Failed to fetch ${source}`);
-				return;
-			}
-
-			cursor = data.cursor;
-
-			for (const record of data.records) {
-				const subjectUri = source === 'likes' ? record.value.subject.uri : record.uri;
-				if (!s.knownIds.has(subjectUri)) {
-					addKnownId(source, subjectUri);
-					s.pendingUris.push(subjectUri);
-					continue;
-				}
-
-				found = true;
-				cursor = localStorage.getItem(`${source}-cursor`) ?? undefined;
-
-				if (cursor) {
-					localStorage.removeItem(`${source}-cursor`);
-					found = false;
-				}
-
-				break;
-			}
-
-			if (cursor && data.records.length > 0) {
-				localStorage.setItem(`${source}-cursor`, cursor);
-				s.cursor = cursor;
-			} else {
-				localStorage.removeItem(`${source}-cursor`);
-				s.cursor = undefined;
-			}
-		} while (cursor && data.records.length > 0 && !found);
+		// Save how far we got into the past
+		if (result.cursor) {
+			await db.meta.put({ source, tailCursor: result.cursor });
+		} else {
+			// We've reached the very end — no tail cursor needed
+			await db.meta.put({ source, tailCursor: undefined });
+		}
 
 		s.totalToIndex = s.pendingUris.length;
 		s.phase = 'hydrating';
 	}
 
-	// Phase 2: Hydrate with getPosts
 	if (s.phase === 'hydrating') {
 		await hydrateUris(source, myGen);
 	}
@@ -269,13 +306,39 @@ async function hydrateUris(source: SourceType, myGen: number) {
 			)
 		);
 
+		// Collect all posts from this chunk
+		const allPosts: any[] = [];
 		for (const result of results) {
 			if (result?.ok) {
-				for (const post of result.data.posts) {
-					s.index!.add(post as any);
-					s.indexed++;
-				}
+				allPosts.push(...result.data.posts);
 			}
+		}
+
+		if (allPosts.length > 0) {
+			// Batch-check which already exist in Dexie
+			const uris = allPosts.map((p) => p.uri);
+			const existing = await db.posts.bulkGet(uris);
+			const existingMap = new Map<string, StoredPost>();
+			for (const doc of existing) {
+				if (doc) existingMap.set(doc.uri, doc);
+			}
+
+			// Build batch for bulkPut
+			const now = Date.now();
+			const toPut: any[] = [];
+			for (const post of allPosts) {
+				const ex = existingMap.get(post.uri);
+				if (ex) {
+					toPut.push({ ...post, sources: [...ex.sources, source], savedAt: ex.savedAt, fetchedAt: now });
+				} else {
+					toPut.push({ ...post, sources: [source], savedAt: now, fetchedAt: now });
+				}
+				s.index!.add(post as any);
+				s.indexed++;
+				s.count++;
+			}
+
+			await db.posts.bulkPut(toPut);
 		}
 
 		s.pendingIndex += chunk.reduce((sum, b) => sum + b.length, 0);
@@ -286,6 +349,61 @@ async function hydrateUris(source: SourceType, myGen: number) {
 	loadNext(myGen);
 }
 
+async function fetchBookmarkPage(
+	source: SourceType,
+	s: SourceState,
+	getBookmarks: Function,
+	cursor: string | undefined,
+	myGen: number
+): Promise<{ cursor: string | undefined; done: boolean }> {
+	if (myGen !== generation) return { cursor, done: true };
+
+	let data: any;
+	try {
+		data = await getBookmarks({ limit: 100, cursor });
+	} catch (err: any) {
+		console.error('Failed to fetch bookmarks:', err);
+		toast.error(`Failed to fetch bookmarks: ${err?.body?.message ?? err?.message ?? err}`);
+		return { cursor, done: true };
+	}
+
+	const validBookmarks = data.bookmarks.filter((b: any) => b.item?.uri);
+	const uris = validBookmarks.map((b: any) => b.item.uri);
+	const existingDocs = await db.posts.bulkGet(uris);
+	const toPut: any[] = [];
+	const now = Date.now();
+
+	for (let j = 0; j < validBookmarks.length; j++) {
+		const bookmark = validBookmarks[j];
+		const postUri = uris[j];
+		const existing = existingDocs[j];
+
+		if (existing) {
+			if (existing.sources.includes(source)) {
+				// Already indexed for this source — flush and stop
+				if (toPut.length > 0) await db.posts.bulkPut(toPut);
+				return { cursor: data.cursor, done: true };
+			}
+			// Exists from another source — queue tag update
+			toPut.push({ ...existing, sources: [...existing.sources, source], fetchedAt: now });
+			s.index!.add(existing as any);
+			s.count++;
+			continue;
+		}
+
+		// Bookmarks come with full PostView — queue for batch write
+		toPut.push({ ...bookmark.item, sources: [source], savedAt: now, fetchedAt: now });
+		s.index!.add(bookmark.item as any);
+		s.indexed++;
+		s.count++;
+	}
+
+	if (toPut.length > 0) await db.posts.bulkPut(toPut);
+
+	const nextCursor = data.bookmarks.length > 0 ? data.cursor : undefined;
+	return { cursor: nextCursor, done: !nextCursor };
+}
+
 async function loadBookmarks(source: SourceType, myGen: number) {
 	if (!user.did || !searchState.sources[source].index) return;
 
@@ -294,71 +412,190 @@ async function loadBookmarks(source: SourceType, myGen: number) {
 	const s = searchState.sources[source];
 	s.phase = 'fetching';
 
-	let cursor = s.cursor;
-	let found = false;
-	let data: any;
+	const meta = await db.meta.get(source);
 
+	// Step 1: Fetch new bookmarks from the top until we hit one we already have
+	let result = { cursor: undefined as string | undefined, done: false };
 	do {
+		result = await fetchBookmarkPage(source, s, getBookmarks, result.cursor, myGen);
+		await s.index!.commit();
+	} while (!result.done && myGen === generation);
+
+	if (myGen !== generation) return;
+
+	// Step 2: Continue from where we left off last time (tail)
+	if (meta?.tailCursor) {
+		result = { cursor: meta.tailCursor, done: false };
+		do {
+			result = await fetchBookmarkPage(source, s, getBookmarks, result.cursor, myGen);
+			await s.index!.commit();
+		} while (!result.done && myGen === generation);
+
 		if (myGen !== generation) return;
+	}
 
-		try {
-			data = await getBookmarks({ limit: 100, cursor });
-		} catch (err: any) {
-			console.error('Failed to fetch bookmarks:', err);
-			toast.error(`Failed to fetch bookmarks: ${err?.body?.message ?? err?.message ?? err}`);
-			return;
-		}
-
-		cursor = data.cursor;
-
-		for (const bookmark of data.bookmarks) {
-			// item can be PostView, BlockedPost, or NotFoundPost — only index PostView
-			if (!bookmark.item?.uri) continue;
-
-			const postUri = bookmark.item.uri;
-			if (!s.knownIds.has(postUri)) {
-				addKnownId(source, postUri);
-				s.index!.add(bookmark.item as any);
-				s.indexed++;
-				s.count = s.knownIds.size;
-				continue;
-			}
-
-			found = true;
-			cursor = localStorage.getItem(`${source}-cursor`) ?? undefined;
-
-			if (cursor) {
-				localStorage.removeItem(`${source}-cursor`);
-				found = false;
-			}
-
-			break;
-		}
-
-		if (cursor && data.bookmarks.length > 0) {
-			localStorage.setItem(`${source}-cursor`, cursor);
-			s.cursor = cursor;
-		} else {
-			localStorage.removeItem(`${source}-cursor`);
-			s.cursor = undefined;
-		}
-	} while (cursor && data.bookmarks.length > 0 && !found);
+	// Save how far we got into the past
+	if (result.cursor) {
+		await db.meta.put({ source, tailCursor: result.cursor });
+	} else {
+		await db.meta.put({ source, tailCursor: undefined });
+	}
 
 	await s.index!.commit();
 	s.phase = 'done';
 	loadNext(myGen);
 }
 
-export async function searchIndex(query: string): Promise<any[]> {
-	const idx = searchState.sources[searchState.activeSource].index;
-	if (!idx || !query) return [];
+// --- Filter helpers ---
 
-	return idx.search({
-		query,
-		enrich: true,
-		merge: true,
-		limit: 20
+function hasEmbedType(doc: any, type: string): boolean {
+	const embed = doc.embed;
+	if (!embed) return false;
+	if (embed.$type === type) return true;
+	if (embed.$type === 'app.bsky.embed.recordWithMedia#view') {
+		return embed.media?.$type === type;
+	}
+	return false;
+}
+
+function hasLinkInFacets(doc: any): boolean {
+	const facets = doc.record?.facets;
+	if (!Array.isArray(facets)) return false;
+	return facets.some(
+		(f: any) => f.features?.some((feat: any) => feat.$type === 'app.bsky.richtext.facet#link')
+	);
+}
+
+function applyFilters(results: any[], filters: SearchFilters): any[] {
+	let r = results;
+	if (filters.handles.length > 0) {
+		r = r.filter((item) => {
+			const h = item.doc.author?.handle?.toLowerCase();
+			return h && filters.handles.some((fh) => h.includes(fh.toLowerCase()));
+		});
+	}
+	if (filters.minLikes > 0) {
+		r = r.filter((item) => (item.doc.likeCount ?? 0) >= filters.minLikes);
+	}
+	if (filters.minReposts > 0) {
+		r = r.filter((item) => (item.doc.repostCount ?? 0) >= filters.minReposts);
+	}
+	if (filters.minReplies > 0) {
+		r = r.filter((item) => (item.doc.replyCount ?? 0) >= filters.minReplies);
+	}
+	if (filters.dateAfter) {
+		const after = new Date(filters.dateAfter).getTime();
+		r = r.filter((item) => {
+			const created = item.doc.record?.createdAt;
+			return created && new Date(created).getTime() >= after;
+		});
+	}
+	if (filters.dateBefore) {
+		const before = new Date(filters.dateBefore).getTime() + 86400000;
+		r = r.filter((item) => {
+			const created = item.doc.record?.createdAt;
+			return created && new Date(created).getTime() <= before;
+		});
+	}
+	if (filters.hasImage) {
+		r = r.filter((item) => hasEmbedType(item.doc, 'app.bsky.embed.images#view'));
+	}
+	if (filters.hasLink) {
+		r = r.filter(
+			(item) =>
+				hasEmbedType(item.doc, 'app.bsky.embed.external#view') || hasLinkInFacets(item.doc)
+		);
+	}
+	if (filters.hasVideo) {
+		r = r.filter((item) => hasEmbedType(item.doc, 'app.bsky.embed.video#view'));
+	}
+	if (!filters.showReplies) {
+		r = r.filter((item) => !item.doc.record?.reply);
+	}
+	return r;
+}
+
+export function filtersActive(filters: SearchFilters): boolean {
+	return (
+		filters.handles.length > 0 ||
+		filters.minLikes > 0 ||
+		filters.minReposts > 0 ||
+		filters.minReplies > 0 ||
+		!!filters.dateAfter ||
+		!!filters.dateBefore ||
+		filters.hasImage ||
+		filters.hasLink ||
+		filters.hasVideo ||
+		!filters.showReplies
+	);
+}
+
+function sortByDate(items: any[]): any[] {
+	return items.sort((a, b) => {
+		const dateA = a.doc.record?.createdAt ? new Date(a.doc.record.createdAt).getTime() : 0;
+		const dateB = b.doc.record?.createdAt ? new Date(b.doc.record.createdAt).getTime() : 0;
+		return dateB - dateA;
 	});
+}
+
+export async function searchIndex(
+	query: string,
+	filters: SearchFilters = DEFAULT_FILTERS,
+	limit: number = 50
+): Promise<{ results: any[]; hasMore: boolean }> {
+	const source = searchState.activeSource;
+	const hasFilters = filtersActive(filters);
+
+	let docs: any[];
+
+	if (query) {
+		// Text search via FlexSearch → get URIs → lookup in Dexie
+		const idx = searchState.sources[source].index;
+		if (!idx) return { results: [], hasMore: false };
+
+		const raw = await idx.search({
+			query,
+			merge: true,
+			limit: hasFilters ? 5000 : limit + 1
+		});
+
+		const uris = raw.map((r: any) => r.id);
+		docs = (await db.posts.bulkGet(uris)).filter(Boolean) as any[];
+	} else {
+		// No query: get all docs for this source from Dexie
+		docs = await db.posts.where('sources').equals(source).toArray();
+	}
+
+	let wrapped = docs.map((doc) => ({ doc }));
+	if (hasFilters) wrapped = applyFilters(wrapped, filters);
+	if (!query) wrapped = sortByDate(wrapped);
+
+	const hasMore = wrapped.length > limit;
+	return { results: wrapped.slice(0, limit), hasMore };
+}
+
+export async function clearSource(source: SourceType) {
+	// Remove source tag from all posts, delete orphans
+	const posts = await db.posts.where('sources').equals(source).toArray();
+	await db.transaction('rw', db.posts, async () => {
+		for (const post of posts) {
+			const newSources = post.sources.filter((s) => s !== source);
+			if (newSources.length === 0) {
+				await db.posts.delete(post.uri);
+			} else {
+				await db.posts.update(post.uri, { sources: newSources });
+			}
+		}
+	});
+	await db.meta.delete(source);
+
+	searchState.sources[source].index?.clear();
+	searchState.sources[source].count = 0;
+	searchState.sources[source].indexed = 0;
+	searchState.sources[source].totalToIndex = 0;
+	searchState.sources[source].phase = 'idle';
+	searchState.sources[source].pendingUris = [];
+	searchState.sources[source].pendingIndex = 0;
 }
 
 export function getLink(uri: string, handle: string) {

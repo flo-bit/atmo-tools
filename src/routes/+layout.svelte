@@ -19,6 +19,6 @@
 
 <Toaster />
 
-<Head title="Search Bluesky" emojiFavicon="🦋" />
+<Head title="atmo.tools" emojiFavicon="🦋" />
 
-<ThemeToggle class="fixed top-4 right-4" />
+<ThemeToggle class="fixed top-2 right-2" />

@@ -1,5 +1,5 @@
 {
-	"name": "search-bluesky-likes",
+	"name": "atmo-tools",
 	"private": true,
 	"version": "0.0.1",
 	"type": "module",
@@ -51,6 +51,7 @@
 	"dependencies": {
 		"@foxui/core": "^0.5.1",
 		"@foxui/social": "^0.5.1",
+		"dexie": "^4.3.0",
 		"flexsearch": "^0.8.212",
 		"valibot": "^1.2.0"
 	},
