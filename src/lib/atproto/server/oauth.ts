@@ -64,7 +64,7 @@ export function createOAuthClient(env?: App.Platform['env']): OAuthClient {
 		return new OAuthClient({
 			metadata: {
 				redirect_uris: [`http://127.0.0.1:${DEV_PORT}${REDIRECT_PATH}`],
-				scope: scopes.join(' ')
+				scope: scopes
 			},
 			actorResolver,
 			stores
@@ -85,7 +85,7 @@ export function createOAuthClient(env?: App.Platform['env']): OAuthClient {
 		metadata: {
 			client_id: site + '/oauth-client-metadata.json',
 			redirect_uris: [site + REDIRECT_PATH],
-			scope: scopes.join(' '),
+			scope: scopes,
 			jwks_uri: site + '/oauth/jwks.json'
 		},
 		keyset: [key],
