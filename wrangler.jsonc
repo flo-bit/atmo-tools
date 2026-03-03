@@ -7,6 +7,9 @@
 		"binding": "ASSETS",
 		"directory": ".svelte-kit/cloudflare"
 	},
+	"vars": {
+		"OAUTH_PUBLIC_URL": "https://atmo.tools"
+	},
 	"kv_namespaces": [
 		{ "binding": "OAUTH_SESSIONS", "id": "87987a15aa874ff28635173747ed2484" },
 		{ "binding": "OAUTH_STATES", "id": "2f40be642daa488c87f196e8f2cbdc04" }

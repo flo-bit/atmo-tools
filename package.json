@@ -53,7 +53,8 @@
 		"@foxui/social": "^0.5.4",
 		"dexie": "^4.3.0",
 		"flexsearch": "^0.8.212",
-		"valibot": "^1.2.0"
+		"valibot": "^1.2.0",
+		"wrangler": "^4.69.0"
 	},
 	"license": "MIT",
 	"pnpm": {
