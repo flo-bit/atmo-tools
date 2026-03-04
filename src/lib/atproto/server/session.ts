@@ -1,7 +1,13 @@
 import type { Cookies } from '@sveltejs/kit';
 import { Client } from '@atcute/client';
 import type { Did } from '@atcute/lexicons';
-import type { OAuthSession } from '@atcute/oauth-node-client';
+import {
+	type OAuthSession,
+	TokenInvalidError,
+	TokenRefreshError,
+	TokenRevokedError,
+	AuthMethodUnsatisfiableError
+} from '@atcute/oauth-node-client';
 import { createOAuthClient } from './oauth';
 import { getSignedCookie } from './signed-cookie';
 import { scopes } from '../settings';
@@ -15,7 +21,8 @@ export type SessionLocals = {
 /**
  * Restores an OAuth session from the signed `did` cookie.
  * Returns session locals to be assigned to `event.locals`.
- * Deletes the cookie if the session can't be restored.
+ * Deletes the cookie only if the session is genuinely unrecoverable.
+ * Transient failures (network, KV) preserve the cookie for retry.
  */
 export async function restoreSession(
 	cookies: Cookies,
@@ -29,7 +36,7 @@ export async function restoreSession(
 
 	// If permissions changed since login, invalidate the session
 	const savedScope = getSignedCookie(cookies, 'scope');
-	if (savedScope !== scopes.join(' ')) {
+	if (savedScope !== null && savedScope !== scopes.join(' ')) {
 		cookies.delete('did', { path: '/' });
 		cookies.delete('scope', { path: '/' });
 		return { session: null, client: null, did: null };
@@ -46,8 +53,21 @@ export async function restoreSession(
 		};
 	} catch (e) {
 		console.error('Failed to restore session:', e);
-		cookies.delete('did', { path: '/' });
-		cookies.delete('scope', { path: '/' });
+
+		// Only delete cookies when the session is genuinely unrecoverable.
+		// Transient errors (network issues, KV hiccups) should preserve the
+		// cookie so the next request can retry without forcing a full re-login.
+		const isSessionGone =
+			e instanceof TokenInvalidError ||
+			e instanceof TokenRevokedError ||
+			e instanceof TokenRefreshError ||
+			e instanceof AuthMethodUnsatisfiableError;
+
+		if (isSessionGone) {
+			cookies.delete('did', { path: '/' });
+			cookies.delete('scope', { path: '/' });
+		}
+
 		return { session: null, client: null, did: null };
 	}
 }
