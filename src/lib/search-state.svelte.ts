@@ -205,9 +205,12 @@ async function fetchRecordPage(
 
 		if (existing) {
 			if (existing.sources.includes(source)) {
-				// Already indexed for this source — flush updates and stop
+				// Already indexed for this source — flush updates and stop.
+				// Use the last record's rkey as cursor so the tail resumes past this point.
+				const lastRecord = data.records[j];
+				const stopCursor = lastRecord?.uri?.split('/').pop() ?? data.cursor;
 				if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
-				return { cursor: data.cursor, done: true };
+				return { cursor: stopCursor, done: true };
 			}
 			// Post exists from another source — queue source tag update
 			toUpdate.push({ ...existing, sources: [...existing.sources, source], fetchedAt: now });
@@ -222,6 +225,10 @@ async function fetchRecordPage(
 	if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
 
 	const nextCursor = data.records.length > 0 ? data.cursor : undefined;
+	// Detect stalled cursor — if the API returns the same cursor we sent, stop.
+	if (nextCursor && nextCursor === cursor) {
+		return { cursor: nextCursor, done: true };
+	}
 	return { cursor: nextCursor, done: !nextCursor };
 }
 
@@ -382,7 +389,7 @@ async function fetchBookmarkPage(
 			if (existing.sources.includes(source)) {
 				// Already indexed for this source — flush and stop
 				if (toPut.length > 0) await db.posts.bulkPut(toPut);
-				return { cursor: data.cursor, done: true };
+				return { cursor: data.cursor ?? cursor, done: true };
 			}
 			// Exists from another source — queue tag update
 			toPut.push({ ...existing, sources: [...existing.sources, source], fetchedAt: now });
@@ -401,6 +408,10 @@ async function fetchBookmarkPage(
 	if (toPut.length > 0) await db.posts.bulkPut(toPut);
 
 	const nextCursor = data.bookmarks.length > 0 ? data.cursor : undefined;
+	// Detect stalled cursor — if the API returns the same cursor we sent, stop.
+	if (nextCursor && nextCursor === cursor) {
+		return { cursor: nextCursor, done: true };
+	}
 	return { cursor: nextCursor, done: !nextCursor };
 }
 
