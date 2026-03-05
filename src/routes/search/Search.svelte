@@ -1,26 +1,27 @@
 <script lang="ts">
 	import { Input, Navbar } from '@foxui/core';
-	import { AtprotoHandlePopup, BlueskyPost, blueskyPostToPostData, Post } from '@foxui/social';
+	import { AtprotoHandlePopup, BlueskyPost } from '@foxui/social';
 	import { onMount } from 'svelte';
 	import {
 		searchState,
 		initSources,
-		switchSource,
+		toggleSource,
+		setActiveSources,
 		searchIndex,
-		filtersActive,
-		DEFAULT_FILTERS,
 		SOURCE_LABELS,
-		PLACEHOLDERS,
+		getPlaceholder,
 		ALL_SOURCES,
+		DEFAULT_FILTERS,
 		type SourceType,
 		type SearchFilters
 	} from '$lib/search-state.svelte';
+	import { filtersActive } from '$lib/db';
 
 	let input: HTMLInputElement | null = $state(null);
 	let search = $state('');
-	let results: any[] = $state([]);
+	let results: { doc: any; isLiked: boolean; isBookmarked: boolean }[] = $state([]);
 	let hasMore = $state(false);
-	let limit = $state(50);
+	let offset = $state(0);
 	let sentinel: HTMLElement | null = $state(null);
 	let scrollY = $state(0);
 
@@ -29,31 +30,37 @@
 	let handleInput = $state('');
 	let hasActiveFilters = $derived(filtersActive(filters));
 
+	const PAGE_SIZE = 50;
+
 	onMount(() => {
 		initSources();
 	});
 
-	function handleSwitchSource(source: SourceType) {
-		switchSource(source);
-	}
-
-	// Reset limit when search params change
+	// Reset offset when search params change
 	$effect(() => {
-		searchState.activeSource;
+		searchState.activeSources;
 		$state.snapshot(filters);
 		search;
-		limit = 50;
+		offset = 0;
+		results = [];
 	});
 
 	// Fetch results
 	$effect(() => {
-		const _source = searchState.activeSource;
+		const _sources = searchState.activeSources;
 		const _filters = $state.snapshot(filters);
-		const _count = searchState.sources[_source].count;
-		const _limit = limit;
+		const _offset = offset;
+		// Track counts of active sources so we re-query as data loads in
+		for (const s of _sources) {
+			searchState.sources[s].count;
+		}
 
-		searchIndex(search, _filters, _limit).then((res) => {
-			results = res.results;
+		searchIndex(search, _filters, _sources, PAGE_SIZE, _offset).then((res) => {
+			if (_offset === 0) {
+				results = res.results;
+			} else {
+				results = [...results, ...res.results];
+			}
 			hasMore = res.hasMore;
 		});
 	});
@@ -66,7 +73,7 @@
 		const observer = new IntersectionObserver(
 			(entries) => {
 				if (entries[0].isIntersecting && hasMore) {
-					limit += 50;
+					offset += PAGE_SIZE;
 				}
 			},
 			{ rootMargin: '400px' }
@@ -82,6 +89,13 @@
 				? 'bg-accent-600 text-white'
 				: 'text-base-600 dark:text-base-400 hover:bg-base-200 dark:hover:bg-base-800'
 		}`;
+
+	const allSourcesActive = $derived(searchState.activeSources.length === ALL_SOURCES.length);
+
+	// Check if only "posts" source is selected (hide handle filter for own posts)
+	const onlyPosts = $derived(
+		searchState.activeSources.length === 1 && searchState.activeSources[0] === 'posts'
+	);
 </script>
 
 <svelte:window
@@ -112,15 +126,24 @@
 		<div class="flex gap-1">
 			{#each ALL_SOURCES as source}
 				<button
-					class="cursor-pointer rounded-full px-3 py-1 text-sm font-medium transition-colors {searchState.activeSource ===
-					source
+					class="cursor-pointer rounded-full px-3 py-1 text-sm font-medium transition-colors {searchState.activeSources.includes(
+						source
+					)
 						? 'bg-accent-600 text-white'
 						: 'text-base-600 dark:text-base-400 hover:bg-base-200 dark:hover:bg-base-800'}"
-					onclick={() => handleSwitchSource(source)}
+					onclick={() => toggleSource(source)}
 				>
 					{SOURCE_LABELS[source]}
 				</button>
 			{/each}
+			<button
+				class="cursor-pointer rounded-full px-3 py-1 text-sm font-medium transition-colors {allSourcesActive
+					? 'bg-accent-600 text-white'
+					: 'text-base-600 dark:text-base-400 hover:bg-base-200 dark:hover:bg-base-800'}"
+				onclick={() => setActiveSources([...ALL_SOURCES])}
+			>
+				All
+			</button>
 		</div>
 	</div>
 
@@ -130,7 +153,7 @@
 			bind:value={search}
 			class="w-full"
 			sizeVariant="lg"
-			placeholder={PLACEHOLDERS[searchState.activeSource]}
+			placeholder={getPlaceholder(searchState.activeSources)}
 		/>
 		<button
 			class="text-base-500 dark:text-base-400 hover:text-accent-600 dark:hover:text-accent-400 relative cursor-pointer p-2 transition-colors"
@@ -157,7 +180,7 @@
 
 	{#if showFilters}
 		<div class="mt-3 flex w-full flex-col gap-3 px-2">
-			{#if searchState.activeSource !== 'posts'}
+			{#if !onlyPosts}
 				<div class="flex flex-col gap-1.5">
 					<div class="flex items-center gap-2">
 						<label class="text-base-500 dark:text-base-400 w-16 shrink-0 text-xs">Handle</label>
@@ -284,19 +307,33 @@
 		</div>
 	{/if}
 
-	{@const src = searchState.sources[searchState.activeSource]}
 	<span class="text-base-600 dark:text-base-400 mx-4 mt-2 text-xs">
-		{#if src.phase === 'idle'}
-			loading...
-		{:else if src.phase === 'fetching'}
-			fetching {SOURCE_LABELS[searchState.activeSource].toLowerCase()}... ({src.count +
-				src.pendingUris.length} found)
-		{:else if src.phase === 'hydrating'}
-			indexing {src.indexed}/{src.totalToIndex}
-			{SOURCE_LABELS[searchState.activeSource].toLowerCase()}... ({src.count} searchable)
+		{#if searchState.activeSources.length === 1}
+			{@const src = searchState.sources[searchState.activeSources[0]]}
+			{#if src.phase === 'idle'}
+				loading...
+			{:else if src.phase === 'fetching'}
+				fetching {SOURCE_LABELS[searchState.activeSources[0]].toLowerCase()}... ({src.count +
+					src.pendingUris.length} found)
+			{:else if src.phase === 'hydrating'}
+				indexing {src.indexed}/{src.totalToIndex}
+				{SOURCE_LABELS[searchState.activeSources[0]].toLowerCase()}... ({src.count} searchable)
+			{:else}
+				{SOURCE_LABELS[searchState.activeSources[0]].toLowerCase()}: {src.count}{#if results.length > 0},
+					{results.length}
+					results{/if}
+			{/if}
 		{:else}
-			{SOURCE_LABELS[searchState.activeSource].toLowerCase()}: {src.count}{#if results.length > 0}, {results.length}
-				results{/if}
+			{@const totalCount = searchState.activeSources.reduce(
+				(sum, s) => sum + searchState.sources[s].count,
+				0
+			)}
+			{@const allDone = searchState.activeSources.every((s) => searchState.sources[s].phase === 'done')}
+			{#if allDone}
+				{totalCount} posts{#if results.length > 0}, {results.length} results{/if}
+			{:else}
+				loading... ({totalCount} found)
+			{/if}
 		{/if}
 	</span>
 </Navbar>
@@ -310,8 +347,8 @@
 		{#each results as result (result.doc.uri)}
 			<li class="py-4">
 				<BlueskyPost
-					liked={result.doc.sources?.includes('likes')}
-					bookmarked={result.doc.sources?.includes('bookmarks')}
+					liked={result.isLiked}
+					bookmarked={result.isBookmarked}
 					showLogo
 					feedViewPost={result.doc}
 				/>

@@ -1,8 +1,15 @@
 <script lang="ts">
 	import { user, logout } from '$lib/atproto';
 	import { Button, Heading, toast } from '@foxui/core';
-	import { clearSource, ALL_SOURCES } from '$lib/search-state.svelte';
+	import { clearAll, clearAccount, listAccounts } from '$lib/search-state.svelte';
 	import { goto } from '$app/navigation';
+	import { onMount } from 'svelte';
+
+	let accounts: { did: string; handle: string; display_name: string | null }[] = $state([]);
+
+	onMount(async () => {
+		accounts = await listAccounts();
+	});
 </script>
 
 {#if user.isLoggedIn}
@@ -21,19 +28,40 @@
 				<p class="text-base-600 dark:text-base-400 text-sm">Signed in as <span class="text-base-800 dark:text-base-200 font-medium">@{user.profile?.handle}</span></p>
 			</div>
 
+			{#if accounts.length > 0}
+				<div class="border-base-300 dark:border-base-800 flex flex-col gap-3 border-t pt-4">
+					<p class="text-base-600 dark:text-base-400 text-xs font-medium uppercase tracking-wide">Cached accounts</p>
+					{#each accounts as account}
+						<div class="flex items-center justify-between">
+							<div class="flex items-center gap-2">
+								<span class="text-base-800 dark:text-base-200 text-sm">@{account.handle}</span>
+								{#if account.did === user.did}
+									<span class="text-base-500 dark:text-base-400 text-xs">(current)</span>
+								{/if}
+							</div>
+							<Button
+								variant="ghost"
+								size="sm"
+								onclick={async () => {
+									await clearAccount(account.did);
+									accounts = accounts.filter((a) => a.did !== account.did);
+									toast.success(`Cleared data for @${account.handle}`);
+								}}
+							>
+								Clear data
+							</Button>
+						</div>
+					{/each}
+				</div>
+			{/if}
+
 			<div class="border-base-300 dark:border-base-800 flex flex-col gap-3 border-t pt-4">
 				<Button
 					variant="ghost"
 					onclick={async () => {
-						for (const source of ALL_SOURCES) {
-							await clearSource(source);
-						}
-						const dbs = await indexedDB.databases();
-						for (const dbInfo of dbs) {
-							if (dbInfo.name) indexedDB.deleteDatabase(dbInfo.name);
-						}
+						await clearAll();
+						accounts = [];
 						toast.success('All data cleared');
-						setTimeout(() => location.reload(), 500);
 					}}
 				>
 					Reset all data
