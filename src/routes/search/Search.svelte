@@ -86,7 +86,8 @@
 
 <svelte:window
 	bind:scrollY
-	onkeydown={() => {
+	onkeydown={(e) => {
+		if (e.key === 'Tab' || e.metaKey || e.ctrlKey || e.altKey) return;
 		const tag = document.activeElement?.tagName;
 		if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
 		input?.focus();
@@ -110,7 +111,7 @@
 <Navbar class="top-12 mx-2 h-auto max-w-xl flex-col items-start py-3 sm:mx-auto md:top-10">
 	<div class="mx-2 mb-4 flex items-baseline gap-2">
 		<div class="flex gap-1">
-			{#each ALL_SOURCES as source}
+			{#each ALL_SOURCES as source (source)}
 				<button
 					class="cursor-pointer rounded-full px-3 py-1 text-sm font-medium transition-colors {searchState.activeSource ===
 					source
@@ -173,7 +174,7 @@
 					</div>
 					{#if filters.handles.length > 0}
 						<div class="ml-18 flex flex-wrap gap-1">
-							{#each filters.handles as handle}
+							{#each filters.handles as handle (handle)}
 								<span
 									class="bg-base-200 dark:bg-base-800 text-base-700 dark:text-base-300 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs"
 								>
@@ -288,12 +289,8 @@
 	<span class="text-base-600 dark:text-base-400 mx-4 mt-2 text-xs">
 		{#if src.phase === 'idle'}
 			loading...
-		{:else if src.phase === 'fetching'}
-			fetching {SOURCE_LABELS[searchState.activeSource].toLowerCase()}... ({src.count +
-				src.pendingUris.length} found)
-		{:else if src.phase === 'hydrating'}
-			indexing {src.indexed}/{src.totalToIndex}
-			{SOURCE_LABELS[searchState.activeSource].toLowerCase()}... ({src.count} searchable)
+		{:else if src.phase === 'loading'}
+			loading {SOURCE_LABELS[searchState.activeSource].toLowerCase()}... ({src.count} indexed)
 		{:else}
 			{SOURCE_LABELS[searchState.activeSource].toLowerCase()}: {src.count}{#if results.length > 0}, {results.length}
 				results{/if}
@@ -313,7 +310,7 @@
 					liked={result.doc.sources?.includes('likes')}
 					bookmarked={result.doc.sources?.includes('bookmarks')}
 					showLogo
-					feedViewPost={result.doc}
+					data={result.doc}
 				/>
 			</li>
 		{/each}

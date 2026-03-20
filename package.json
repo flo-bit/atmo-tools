@@ -50,7 +50,7 @@
 	},
 	"dependencies": {
 		"@foxui/core": "^0.5.2",
-		"@foxui/social": "^0.5.4",
+		"@foxui/social": "^0.6.0",
 		"dexie": "^4.3.0",
 		"flexsearch": "^0.8.212",
 		"valibot": "^1.2.0",

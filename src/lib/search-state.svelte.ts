@@ -2,7 +2,7 @@ import { user } from '$lib/atproto';
 import { toast } from '@foxui/core';
 import { Document, Charset, IndexedDB } from 'flexsearch';
 import { Client, simpleFetchHandler } from '@atcute/client';
-import { db, type StoredPost } from '$lib/db';
+import { openDb, getDb, type StoredPost } from '$lib/db';
 
 export type SourceType = 'likes' | 'bookmarks' | 'posts' | 'reposts';
 
@@ -51,22 +51,14 @@ export const ALL_SOURCES: SourceType[] = ['likes', 'bookmarks', 'posts', 'repost
 type SourceState = {
 	index: Document | null;
 	count: number;
-	indexed: number;
-	totalToIndex: number;
-	phase: 'idle' | 'fetching' | 'hydrating' | 'done';
-	pendingUris: string[];
-	pendingIndex: number;
+	phase: 'idle' | 'loading' | 'done';
 };
 
 function createSourceState(): SourceState {
 	return {
 		index: null,
 		count: 0,
-		indexed: 0,
-		totalToIndex: 0,
-		phase: 'idle',
-		pendingUris: [],
-		pendingIndex: 0
+		phase: 'idle'
 	};
 }
 
@@ -90,10 +82,53 @@ function createIndex() {
 					field: 'record:text',
 					tokenize: 'forward',
 					encoder: Charset.LatinBalance
+				},
+				{
+					field: '_embedText',
+					tokenize: 'forward',
+					encoder: Charset.LatinBalance
 				}
 			]
 		}
 	});
+}
+
+function getEmbedText(post: any): string {
+	const parts: string[] = [];
+	const embed = post.embed;
+	if (!embed) return '';
+
+	// Link embed: title + description
+	if (embed.$type === 'app.bsky.embed.external#view') {
+		if (embed.external?.title) parts.push(embed.external.title);
+		if (embed.external?.description) parts.push(embed.external.description);
+	}
+
+	// Quote embed: quoted post text
+	if (embed.$type === 'app.bsky.embed.record#view') {
+		if (embed.record?.value?.text) parts.push(embed.record.value.text);
+	}
+
+	// Record + media combo
+	if (embed.$type === 'app.bsky.embed.recordWithMedia#view') {
+		if (embed.record?.record?.value?.text) parts.push(embed.record.record.value.text);
+		const media = embed.media;
+		if (media?.$type === 'app.bsky.embed.external#view') {
+			if (media.external?.title) parts.push(media.external.title);
+			if (media.external?.description) parts.push(media.external.description);
+		}
+	}
+
+	return parts.join(' ');
+}
+
+function indexPost(index: Document, post: any) {
+	const embedText = getEmbedText(post);
+	if (embedText) {
+		index.add({ ...post, _embedText: embedText } as any);
+	} else {
+		index.add(post as any);
+	}
 }
 
 const publicClient = new Client({
@@ -113,6 +148,10 @@ export const searchState = $state({
 let generation = 0;
 
 export async function initSources() {
+	if (!user.did) return;
+
+	const db = openDb(user.did);
+
 	// Clean up legacy localStorage data
 	for (const source of ALL_SOURCES) {
 		localStorage.removeItem(`${source}-ids`);
@@ -121,7 +160,7 @@ export async function initSources() {
 
 	await Promise.all(
 		ALL_SOURCES.map(async (source) => {
-			const flexDb = new IndexedDB(`${source}-idx`);
+			const flexDb = new IndexedDB(`${user.did}-${source}-idx`);
 			searchState.sources[source].index = createIndex();
 			await searchState.sources[source].index!.mount(flexDb);
 
@@ -174,12 +213,13 @@ function loadNext(currentGen: number) {
 	}
 }
 
-async function fetchRecordPage(
+async function fetchAndHydratePage(
 	source: SourceType,
 	s: SourceState,
 	fetchFn: Function,
 	cursor: string | undefined,
-	myGen: number
+	myGen: number,
+	stopOnExisting = true
 ): Promise<{ cursor: string | undefined; done: boolean }> {
 	if (myGen !== generation) return { cursor, done: true };
 
@@ -195,8 +235,10 @@ async function fetchRecordPage(
 	const uris = data.records.map((r: any) =>
 		source === 'posts' ? r.uri : r.value.subject.uri
 	);
+	const db = getDb();
 	const existingDocs = await db.posts.bulkGet(uris);
 	const toUpdate: any[] = [];
+	const toHydrate: string[] = [];
 	const now = Date.now();
 
 	for (let j = 0; j < uris.length; j++) {
@@ -205,27 +247,78 @@ async function fetchRecordPage(
 
 		if (existing) {
 			if (existing.sources.includes(source)) {
-				// Already indexed for this source — flush updates and stop.
-				// Use the last record's rkey as cursor so the tail resumes past this point.
-				const lastRecord = data.records[j];
-				const stopCursor = lastRecord?.uri?.split('/').pop() ?? data.cursor;
-				if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
-				return { cursor: stopCursor, done: true };
+				if (stopOnExisting) {
+					// Already indexed for this source — flush updates and stop.
+					const lastRecord = data.records[j];
+					const stopCursor = lastRecord?.uri?.split('/').pop() ?? data.cursor;
+					if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
+					return { cursor: stopCursor, done: true };
+				}
+				// Resuming an interrupted fetch — skip already-processed posts
+				continue;
 			}
-			// Post exists from another source — queue source tag update
+			// Post exists from another source — add source tag
 			toUpdate.push({ ...existing, sources: [...existing.sources, source], fetchedAt: now });
-			s.index!.add(existing as any);
+			indexPost(s.index!, existing);
 			s.count++;
 			continue;
 		}
 
-		s.pendingUris.push(subjectUri);
+		toHydrate.push(subjectUri);
 	}
 
 	if (toUpdate.length > 0) await db.posts.bulkPut(toUpdate);
 
+	// Hydrate new URIs inline via getPosts
+	if (toHydrate.length > 0) {
+		const BATCH = 25;
+		const batches: string[][] = [];
+		for (let i = 0; i < toHydrate.length; i += BATCH) {
+			batches.push(toHydrate.slice(i, i + BATCH));
+		}
+
+		const results = await Promise.all(
+			batches.map((batch) =>
+				publicClient
+					.get('app.bsky.feed.getPosts', { params: { uris: batch as any } })
+					.catch((e) => {
+						console.error(`Failed to hydrate ${source} batch:`, e);
+						return null;
+					})
+			)
+		);
+
+		const allPosts: any[] = [];
+		for (const result of results) {
+			if (result?.ok) allPosts.push(...result.data.posts);
+		}
+
+		if (allPosts.length > 0) {
+			const existingPosts = await db.posts.bulkGet(allPosts.map((p) => p.uri));
+			const existingMap = new Map<string, StoredPost>();
+			for (const doc of existingPosts) {
+				if (doc) existingMap.set(doc.uri, doc);
+			}
+
+			const toPut: any[] = [];
+			for (const post of allPosts) {
+				const ex = existingMap.get(post.uri);
+				if (ex) {
+					toPut.push({ ...post, sources: [...ex.sources, source], savedAt: ex.savedAt, fetchedAt: now });
+				} else {
+					toPut.push({ ...post, sources: [source], savedAt: now, fetchedAt: now });
+				}
+				indexPost(s.index!, post);
+				s.count++;
+			}
+
+			await db.posts.bulkPut(toPut);
+		}
+	}
+
+	await s.index!.commit();
+
 	const nextCursor = data.records.length > 0 ? data.cursor : undefined;
-	// Detect stalled cursor — if the API returns the same cursor we sent, stop.
 	if (nextCursor && nextCursor === cursor) {
 		return { cursor: nextCursor, done: true };
 	}
@@ -246,110 +339,47 @@ async function loadRecords(source: SourceType, myGen: number) {
 				: listPostRecords;
 
 	const s = searchState.sources[source];
+	s.phase = 'loading';
 
-	if (s.phase === 'idle' || s.phase === 'fetching') {
-		s.phase = 'fetching';
+	const db = getDb();
+	const meta = await db.meta.get(source);
 
-		const meta = await db.meta.get(source);
+	// Step 1: Fetch new posts from the top until we hit one we already have
+	// If fetchCursor is set, we were interrupted last time — resume from there
+	const isResuming = !!meta?.fetchCursor;
+	let result = { cursor: meta?.fetchCursor as string | undefined, done: false };
+	do {
+		// When resuming, don't stop on existing posts — the interrupted page
+		// may have partially-hydrated posts in Dexie that would trigger a false stop
+		result = await fetchAndHydratePage(source, s, fetchFn, result.cursor, myGen, !isResuming);
+		if (myGen !== generation) return;
+		// Save fetch progress so we can resume on reload
+		if (!result.done && result.cursor) {
+			await db.meta.put({ ...meta, source, fetchCursor: result.cursor });
+		}
+	} while (!result.done);
 
-		// Step 1: Fetch new posts from the top until we hit one we already have
-		let result = { cursor: undefined as string | undefined, done: false };
+	// Pass 1 complete — clear fetchCursor
+	await db.meta.put({ ...meta, source, fetchCursor: undefined });
+
+	// Step 2: Continue from where we left off last time (tail)
+	if (meta?.tailCursor) {
+		result = { cursor: meta.tailCursor, done: false };
 		do {
-			result = await fetchRecordPage(source, s, fetchFn, result.cursor, myGen);
-		} while (!result.done && myGen === generation);
-
-		if (myGen !== generation) return;
-
-		// Step 2: Continue from where we left off last time (tail)
-		if (meta?.tailCursor) {
-			result = { cursor: meta.tailCursor, done: false };
-			do {
-				result = await fetchRecordPage(source, s, fetchFn, result.cursor, myGen);
-			} while (!result.done && myGen === generation);
-
+			result = await fetchAndHydratePage(source, s, fetchFn, result.cursor, myGen);
 			if (myGen !== generation) return;
-		}
-
-		// Save how far we got into the past
-		if (result.cursor) {
-			await db.meta.put({ source, tailCursor: result.cursor });
-		} else {
-			// We've reached the very end — no tail cursor needed
-			await db.meta.put({ source, tailCursor: undefined });
-		}
-
-		s.totalToIndex = s.pendingUris.length;
-		s.phase = 'hydrating';
+			// Save tail progress incrementally
+			if (result.cursor) {
+				await db.meta.put({ source, tailCursor: result.cursor });
+			}
+		} while (!result.done);
 	}
 
-	if (s.phase === 'hydrating') {
-		await hydrateUris(source, myGen);
-	}
-}
-
-async function hydrateUris(source: SourceType, myGen: number) {
-	const s = searchState.sources[source];
-	const BATCH_SIZE = 25;
-	const CONCURRENCY = 5;
-
-	const remaining = s.pendingUris.slice(s.pendingIndex);
-	const batches: string[][] = [];
-	for (let i = 0; i < remaining.length; i += BATCH_SIZE) {
-		batches.push(remaining.slice(i, i + BATCH_SIZE));
-	}
-
-	for (let i = 0; i < batches.length; i += CONCURRENCY) {
-		if (myGen !== generation) return;
-
-		const chunk = batches.slice(i, i + CONCURRENCY);
-		const results = await Promise.all(
-			chunk.map((uris) =>
-				publicClient
-					.get('app.bsky.feed.getPosts', { params: { uris: uris as any } })
-					.catch((e) => {
-						console.error(`Failed to hydrate ${source} batch:`, e);
-						return null;
-					})
-			)
-		);
-
-		// Collect all posts from this chunk
-		const allPosts: any[] = [];
-		for (const result of results) {
-			if (result?.ok) {
-				allPosts.push(...result.data.posts);
-			}
-		}
-
-		if (allPosts.length > 0) {
-			// Batch-check which already exist in Dexie
-			const uris = allPosts.map((p) => p.uri);
-			const existing = await db.posts.bulkGet(uris);
-			const existingMap = new Map<string, StoredPost>();
-			for (const doc of existing) {
-				if (doc) existingMap.set(doc.uri, doc);
-			}
-
-			// Build batch for bulkPut
-			const now = Date.now();
-			const toPut: any[] = [];
-			for (const post of allPosts) {
-				const ex = existingMap.get(post.uri);
-				if (ex) {
-					toPut.push({ ...post, sources: [...ex.sources, source], savedAt: ex.savedAt, fetchedAt: now });
-				} else {
-					toPut.push({ ...post, sources: [source], savedAt: now, fetchedAt: now });
-				}
-				s.index!.add(post as any);
-				s.indexed++;
-				s.count++;
-			}
-
-			await db.posts.bulkPut(toPut);
-		}
-
-		s.pendingIndex += chunk.reduce((sum, b) => sum + b.length, 0);
-		await s.index!.commit();
+	// Save final tail position
+	if (result.cursor) {
+		await db.meta.put({ source, tailCursor: result.cursor });
+	} else {
+		await db.meta.put({ source, tailCursor: undefined });
 	}
 
 	s.phase = 'done';
@@ -361,7 +391,8 @@ async function fetchBookmarkPage(
 	s: SourceState,
 	getBookmarks: Function,
 	cursor: string | undefined,
-	myGen: number
+	myGen: number,
+	stopOnExisting = true
 ): Promise<{ cursor: string | undefined; done: boolean }> {
 	if (myGen !== generation) return { cursor, done: true };
 
@@ -374,6 +405,7 @@ async function fetchBookmarkPage(
 		return { cursor, done: true };
 	}
 
+	const db = getDb();
 	const validBookmarks = data.bookmarks.filter((b: any) => b.item?.uri);
 	const uris = validBookmarks.map((b: any) => b.item.uri);
 	const existingDocs = await db.posts.bulkGet(uris);
@@ -382,33 +414,34 @@ async function fetchBookmarkPage(
 
 	for (let j = 0; j < validBookmarks.length; j++) {
 		const bookmark = validBookmarks[j];
-		const postUri = uris[j];
 		const existing = existingDocs[j];
 
 		if (existing) {
 			if (existing.sources.includes(source)) {
-				// Already indexed for this source — flush and stop
-				if (toPut.length > 0) await db.posts.bulkPut(toPut);
-				return { cursor: data.cursor ?? cursor, done: true };
+				if (stopOnExisting) {
+					// Already indexed for this source — flush and stop
+					if (toPut.length > 0) await db.posts.bulkPut(toPut);
+					return { cursor: data.cursor ?? cursor, done: true };
+				}
+				// Resuming an interrupted fetch — skip already-processed posts
+				continue;
 			}
-			// Exists from another source — queue tag update
+			// Exists from another source — add source tag
 			toPut.push({ ...existing, sources: [...existing.sources, source], fetchedAt: now });
-			s.index!.add(existing as any);
+			indexPost(s.index!, existing);
 			s.count++;
 			continue;
 		}
 
-		// Bookmarks come with full PostView — queue for batch write
+		// Bookmarks come with full PostView — store directly
 		toPut.push({ ...bookmark.item, sources: [source], savedAt: now, fetchedAt: now });
-		s.index!.add(bookmark.item as any);
-		s.indexed++;
+		indexPost(s.index!, bookmark.item);
 		s.count++;
 	}
 
 	if (toPut.length > 0) await db.posts.bulkPut(toPut);
 
 	const nextCursor = data.bookmarks.length > 0 ? data.cursor : undefined;
-	// Detect stalled cursor — if the API returns the same cursor we sent, stop.
 	if (nextCursor && nextCursor === cursor) {
 		return { cursor: nextCursor, done: true };
 	}
@@ -420,19 +453,26 @@ async function loadBookmarks(source: SourceType, myGen: number) {
 
 	const { getBookmarks } = await import('$lib/atproto/server/search.remote');
 
+	const db = getDb();
 	const s = searchState.sources[source];
-	s.phase = 'fetching';
+	s.phase = 'loading';
 
 	const meta = await db.meta.get(source);
 
 	// Step 1: Fetch new bookmarks from the top until we hit one we already have
-	let result = { cursor: undefined as string | undefined, done: false };
+	const isResuming = !!meta?.fetchCursor;
+	let result = { cursor: meta?.fetchCursor as string | undefined, done: false };
 	do {
-		result = await fetchBookmarkPage(source, s, getBookmarks, result.cursor, myGen);
+		result = await fetchBookmarkPage(source, s, getBookmarks, result.cursor, myGen, !isResuming);
 		await s.index!.commit();
-	} while (!result.done && myGen === generation);
+		if (myGen !== generation) return;
+		if (!result.done && result.cursor) {
+			await db.meta.put({ ...meta, source, fetchCursor: result.cursor });
+		}
+	} while (!result.done);
 
-	if (myGen !== generation) return;
+	// Pass 1 complete — clear fetchCursor
+	await db.meta.put({ ...meta, source, fetchCursor: undefined });
 
 	// Step 2: Continue from where we left off last time (tail)
 	if (meta?.tailCursor) {
@@ -440,12 +480,14 @@ async function loadBookmarks(source: SourceType, myGen: number) {
 		do {
 			result = await fetchBookmarkPage(source, s, getBookmarks, result.cursor, myGen);
 			await s.index!.commit();
-		} while (!result.done && myGen === generation);
-
-		if (myGen !== generation) return;
+			if (myGen !== generation) return;
+			if (result.cursor) {
+				await db.meta.put({ source, tailCursor: result.cursor });
+			}
+		} while (!result.done);
 	}
 
-	// Save how far we got into the past
+	// Save final tail position
 	if (result.cursor) {
 		await db.meta.put({ source, tailCursor: result.cursor });
 	} else {
@@ -556,6 +598,7 @@ export async function searchIndex(
 ): Promise<{ results: any[]; hasMore: boolean }> {
 	const source = searchState.activeSource;
 	const hasFilters = filtersActive(filters);
+	const db = getDb();
 
 	let docs: any[];
 
@@ -586,6 +629,7 @@ export async function searchIndex(
 }
 
 export async function clearSource(source: SourceType) {
+	const db = getDb();
 	// Remove source tag from all posts, delete orphans
 	const posts = await db.posts.where('sources').equals(source).toArray();
 	await db.transaction('rw', db.posts, async () => {
@@ -602,11 +646,7 @@ export async function clearSource(source: SourceType) {
 
 	searchState.sources[source].index?.clear();
 	searchState.sources[source].count = 0;
-	searchState.sources[source].indexed = 0;
-	searchState.sources[source].totalToIndex = 0;
 	searchState.sources[source].phase = 'idle';
-	searchState.sources[source].pendingUris = [];
-	searchState.sources[source].pendingIndex = 0;
 }
 
 export function getLink(uri: string, handle: string) {
