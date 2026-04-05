@@ -17,6 +17,7 @@ export type SearchFilters = {
 	hasLink: boolean;
 	hasVideo: boolean;
 	showReplies: boolean;
+	onlyReplies: boolean;
 };
 
 export const DEFAULT_FILTERS: SearchFilters = {
@@ -29,7 +30,8 @@ export const DEFAULT_FILTERS: SearchFilters = {
 	hasImage: false,
 	hasLink: false,
 	hasVideo: false,
-	showReplies: true
+	showReplies: true,
+	onlyReplies: false
 };
 
 export const SOURCE_LABELS: Record<SourceType, string> = {
@@ -565,6 +567,9 @@ function applyFilters(results: any[], filters: SearchFilters): any[] {
 	if (!filters.showReplies) {
 		r = r.filter((item) => !item.doc.record?.reply);
 	}
+	if (filters.onlyReplies) {
+		r = r.filter((item) => !!item.doc.record?.reply);
+	}
 	return r;
 }
 
@@ -579,7 +584,8 @@ export function filtersActive(filters: SearchFilters): boolean {
 		filters.hasImage ||
 		filters.hasLink ||
 		filters.hasVideo ||
-		!filters.showReplies
+		!filters.showReplies ||
+		filters.onlyReplies
 	);
 }
 

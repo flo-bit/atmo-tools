@@ -1,7 +1,8 @@
 <script lang="ts">
 	import { Input, Navbar } from '@foxui/core';
-	import { AtprotoHandlePopup, BlueskyPost, blueskyPostToPostData, Post } from '@foxui/social';
+	import { AtprotoHandlePopup } from '@foxui/social';
 	import { onMount } from 'svelte';
+	import { SvelteMap } from 'svelte/reactivity';
 	import {
 		searchState,
 		initSources,
@@ -15,6 +16,22 @@
 		type SourceType,
 		type SearchFilters
 	} from '$lib/search-state.svelte';
+	import { BlueskyPost } from '$lib/bluesky-post';
+
+	const resolvedHandles = new SvelteMap<string, string>();
+	const pendingDids = new Set<string>();
+
+	function resolveHandle(did: string) {
+		if (!did?.startsWith('did:') || resolvedHandles.has(did) || pendingDids.has(did)) return;
+		pendingDids.add(did);
+		fetch(`https://slingshot.microcosm.blue/xrpc/com.bad-example.identity.resolveMiniDoc?identifier=${encodeURIComponent(did)}`)
+			.then((r) => r.json())
+			.then((data: { handle?: string }) => {
+				if (data.handle) resolvedHandles.set(did, data.handle);
+			})
+			.catch(() => {})
+			.finally(() => pendingDids.delete(did));
+	}
 
 	let input: HTMLInputElement | null = $state(null);
 	let search = $state('');
@@ -56,6 +73,14 @@
 			results = res.results;
 			hasMore = res.hasMore;
 		});
+	});
+
+	// Resolve reply parent handles
+	$effect(() => {
+		for (const result of results) {
+			const parentUri = result.doc.record?.reply?.parent?.uri;
+			if (parentUri) resolveHandle(parentUri.split('/')[2]);
+		}
 	});
 
 	// Infinite scroll via IntersectionObserver
@@ -270,7 +295,17 @@
 			<div class="flex items-center gap-2">
 				<button
 					class={pillClass(!filters.showReplies)}
-					onclick={() => (filters.showReplies = !filters.showReplies)}>Hide replies</button
+					onclick={() => {
+						filters.showReplies = !filters.showReplies;
+						if (!filters.showReplies) filters.onlyReplies = false;
+					}}>Hide replies</button
+				>
+				<button
+					class={pillClass(filters.onlyReplies)}
+					onclick={() => {
+						filters.onlyReplies = !filters.onlyReplies;
+						if (filters.onlyReplies) filters.showReplies = true;
+					}}>Only replies</button
 				>
 			</div>
 
@@ -305,12 +340,16 @@
 			: 'pt-32 md:pt-20'} divide-base-200 dark:divide-base-800 flex flex-col divide-y text-sm"
 	>
 		{#each results as result (result.doc.uri)}
+			{@const parentUri = result.doc.record?.reply?.parent?.uri}
+			{@const parentDid = parentUri?.split('/')[2]}
+			{@const parentHandle = parentDid ? (resolvedHandles.get(parentDid) ?? parentDid) : undefined}
 			<li class="py-4">
 				<BlueskyPost
-					liked={result.doc.sources?.includes('likes')}
-					bookmarked={result.doc.sources?.includes('bookmarks')}
+						liked={result.doc.sources?.includes('likes')}
+						bookmarked={result.doc.sources?.includes('bookmarks')}
 					showLogo
 					data={result.doc}
+					reply={parentUri ? { parent: { author: { handle: parentHandle, did: parentDid }, uri: parentUri } } : undefined}
 				/>
 			</li>
 		{/each}
