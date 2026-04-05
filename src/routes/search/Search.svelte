@@ -26,8 +26,9 @@
 		pendingDids.add(did);
 		fetch(`https://slingshot.microcosm.blue/xrpc/com.bad-example.identity.resolveMiniDoc?identifier=${encodeURIComponent(did)}`)
 			.then((r) => r.json())
-			.then((data: { handle?: string }) => {
-				if (data.handle) resolvedHandles.set(did, data.handle);
+			.then((data) => {
+				const { handle } = data as { handle?: string };
+				if (handle) resolvedHandles.set(did, handle);
 			})
 			.catch(() => {})
 			.finally(() => pendingDids.delete(did));
@@ -134,11 +135,11 @@
 </a>
 
 <Navbar class="top-12 mx-2 h-auto max-w-xl flex-col items-start py-3 sm:mx-auto md:top-10">
-	<div class="mx-2 mb-4 flex items-baseline gap-2">
-		<div class="flex gap-1">
+	<div class="mx-1 mb-3 flex items-baseline gap-1 sm:mx-2 sm:mb-4 sm:gap-2">
+		<div class="flex gap-0.5 sm:gap-1">
 			{#each ALL_SOURCES as source (source)}
 				<button
-					class="cursor-pointer rounded-full px-3 py-1 text-sm font-medium transition-colors {searchState.activeSource ===
+					class="cursor-pointer rounded-full px-2 py-0.5 text-xs font-medium transition-colors sm:px-3 sm:py-1 sm:text-sm {searchState.activeSource ===
 					source
 						? 'bg-accent-600 text-white'
 						: 'text-base-600 dark:text-base-400 hover:bg-base-200 dark:hover:bg-base-800'}"

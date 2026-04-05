@@ -4,7 +4,7 @@ import { Document, Charset, IndexedDB } from 'flexsearch';
 import { Client, simpleFetchHandler } from '@atcute/client';
 import { openDb, getDb, type StoredPost } from '$lib/db';
 
-export type SourceType = 'likes' | 'bookmarks' | 'posts' | 'reposts';
+export type SourceType = 'likes' | 'bookmarks' | 'posts' | 'reposts' | 'replies';
 
 export type SearchFilters = {
 	handles: string[];
@@ -38,17 +38,19 @@ export const SOURCE_LABELS: Record<SourceType, string> = {
 	likes: 'Likes',
 	bookmarks: 'Bookmarks',
 	posts: 'Posts',
-	reposts: 'Reposts'
+	reposts: 'Reposts',
+	replies: 'Replies'
 };
 
 export const PLACEHOLDERS: Record<SourceType, string> = {
 	likes: 'Search liked posts',
 	bookmarks: 'Search bookmarks',
 	posts: 'Search my posts',
-	reposts: 'Search reposted posts'
+	reposts: 'Search reposted posts',
+	replies: 'Search replies to my posts'
 };
 
-export const ALL_SOURCES: SourceType[] = ['likes', 'bookmarks', 'posts', 'reposts'];
+export const ALL_SOURCES: SourceType[] = ['likes', 'bookmarks', 'posts', 'reposts', 'replies'];
 
 type SourceState = {
 	index: Document | null;
@@ -142,7 +144,8 @@ export const searchState = $state({
 		likes: createSourceState(),
 		bookmarks: createSourceState(),
 		posts: createSourceState(),
-		reposts: createSourceState()
+		reposts: createSourceState(),
+		replies: createSourceState()
 	} as Record<SourceType, SourceState>,
 	activeSource: 'likes' as SourceType
 });
@@ -195,6 +198,8 @@ export function startLoading(source: SourceType) {
 
 	if (source === 'bookmarks') {
 		loadBookmarks(source, myGen);
+	} else if (source === 'replies') {
+		loadReplies(myGen);
 	} else {
 		loadRecords(source, myGen);
 	}
@@ -501,6 +506,155 @@ async function loadBookmarks(source: SourceType, myGen: number) {
 	loadNext(myGen);
 }
 
+// --- Replies loading ---
+
+const HOUR = 3_600_000;
+const DAY = 86_400_000;
+
+function getRefreshInterval(postAgeMs: number): number {
+	if (postAgeMs < 4 * HOUR) return 1 * HOUR;
+	if (postAgeMs < 1 * DAY) return 4 * HOUR;
+	if (postAgeMs < 3 * DAY) return 12 * HOUR;
+	if (postAgeMs < 7 * DAY) return 1 * DAY;
+	if (postAgeMs < 30 * DAY) return 3 * DAY;
+	return 7 * DAY;
+}
+
+async function loadReplies(myGen: number) {
+	if (!user.did) return;
+
+	const s = searchState.sources.replies;
+	s.phase = 'loading';
+
+	const db = getDb();
+	const now = Date.now();
+
+	// Get all user posts from Dexie
+	const userPosts = await db.posts.where('sources').equals('posts').toArray();
+	if (myGen !== generation) return;
+
+	// Sort newest first
+	userPosts.sort((a, b) => {
+		const dateA = a.record?.createdAt ? new Date(a.record.createdAt).getTime() : 0;
+		const dateB = b.record?.createdAt ? new Date(b.record.createdAt).getTime() : 0;
+		return dateB - dateA;
+	});
+
+	// Get thread meta for all posts
+	const metaEntries = await db.threadMeta.bulkGet(userPosts.map((p) => p.uri));
+	const metaMap = new Map<string, { repliesFetchedAt: number }>();
+	for (let i = 0; i < userPosts.length; i++) {
+		if (metaEntries[i]) metaMap.set(userPosts[i].uri, metaEntries[i]!);
+	}
+
+	// Filter to posts needing a refresh
+	const fetchQueue: typeof userPosts = [];
+	for (const post of userPosts) {
+		// Skip posts with zero replies
+		if ((post.replyCount ?? 0) === 0) continue;
+
+		const meta = metaMap.get(post.uri);
+		if (!meta) {
+			fetchQueue.push(post);
+			continue;
+		}
+
+		const postAge = post.record?.createdAt
+			? now - new Date(post.record.createdAt).getTime()
+			: Infinity;
+		const interval = getRefreshInterval(postAge);
+		if (now - meta.repliesFetchedAt >= interval) {
+			fetchQueue.push(post);
+		}
+	}
+
+	// Process in batches of 5
+	const BATCH_SIZE = 5;
+	let backoff = 1000;
+
+	for (let i = 0; i < fetchQueue.length; i += BATCH_SIZE) {
+		if (myGen !== generation) return;
+
+		const batch = fetchQueue.slice(i, i + BATCH_SIZE);
+		const results = await Promise.all(
+			batch.map((post) =>
+				publicClient
+					.get('app.bsky.feed.getPostThread', {
+						params: { uri: post.uri, depth: 1, parentHeight: 0 } as any
+					})
+					.catch((e: any) => {
+						if (e?.status === 429) return { ok: false, rateLimited: true } as any;
+						console.error('Failed to fetch thread:', post.uri, e);
+						return null;
+					})
+			)
+		);
+
+		// Check for rate limiting
+		const rateLimited = results.some((r: any) => r?.rateLimited);
+		if (rateLimited) {
+			await new Promise((resolve) => setTimeout(resolve, backoff));
+			backoff = Math.min(backoff * 2, 30000);
+			i -= BATCH_SIZE; // Retry this batch
+			continue;
+		}
+		backoff = 1000; // Reset backoff on success
+
+		// Collect all reply posts from this batch
+		const allReplyPosts: { post: any; parentIdx: number }[] = [];
+		const metaToPut: any[] = [];
+
+		for (let j = 0; j < results.length; j++) {
+			const result = results[j];
+			if (!result?.ok) continue;
+
+			const thread = result.data.thread;
+			if (thread.$type !== 'app.bsky.feed.defs#threadViewPost') continue;
+
+			const replies = (thread as any).replies ?? [];
+			for (const reply of replies) {
+				if (reply.$type !== 'app.bsky.feed.defs#threadViewPost' || !reply.post?.uri) continue;
+				allReplyPosts.push({ post: reply.post, parentIdx: j });
+			}
+
+			metaToPut.push({ uri: batch[j].uri, repliesFetchedAt: now });
+		}
+
+		// Batch-lookup existing posts
+		const replyUris = allReplyPosts.map((r) => r.post.uri);
+		const existingPosts = await db.posts.bulkGet(replyUris);
+		const toPut: any[] = [];
+
+		for (let k = 0; k < allReplyPosts.length; k++) {
+			const replyPost = allReplyPosts[k].post;
+			const existing = existingPosts[k];
+
+			if (existing) {
+				if (!existing.sources.includes('replies')) {
+					toPut.push({
+						...existing,
+						sources: [...existing.sources, 'replies'],
+						fetchedAt: now
+					});
+					indexPost(s.index!, existing);
+					s.count++;
+				}
+			} else {
+				toPut.push({ ...replyPost, sources: ['replies'], savedAt: now, fetchedAt: now });
+				indexPost(s.index!, replyPost);
+				s.count++;
+			}
+		}
+
+		if (toPut.length > 0) await db.posts.bulkPut(toPut);
+		if (metaToPut.length > 0) await db.threadMeta.bulkPut(metaToPut);
+		await s.index!.commit();
+	}
+
+	s.phase = 'done';
+	loadNext(myGen);
+}
+
 // --- Filter helpers ---
 
 function hasEmbedType(doc: any, type: string): boolean {
@@ -649,6 +803,9 @@ export async function clearSource(source: SourceType) {
 		}
 	});
 	await db.meta.delete(source);
+	if (source === 'replies') {
+		await db.threadMeta.clear();
+	}
 
 	searchState.sources[source].index?.clear();
 	searchState.sources[source].count = 0;
