@@ -3,6 +3,8 @@
 	import { AtprotoHandlePopup } from '@foxui/social';
 	import { onMount } from 'svelte';
 	import { SvelteMap } from 'svelte/reactivity';
+	import { page } from '$app/state';
+	import { replaceState } from '$app/navigation';
 	import {
 		searchState,
 		initSources,
@@ -35,7 +37,7 @@
 	}
 
 	let input: HTMLInputElement | null = $state(null);
-	let search = $state('');
+	let search = $state(page.url.searchParams.get('q') ?? '');
 	let results: any[] = $state([]);
 	let hasMore = $state(false);
 	let limit = $state(50);
@@ -54,6 +56,14 @@
 	function handleSwitchSource(source: SourceType) {
 		switchSource(source);
 	}
+
+	// Sync search term to URL (?q=...)
+	$effect(() => {
+		const url = new URL(page.url);
+		if (search) url.searchParams.set('q', search);
+		else url.searchParams.delete('q');
+		if (url.search !== page.url.search) replaceState(url, page.state);
+	});
 
 	// Reset limit when search params change
 	$effect(() => {
